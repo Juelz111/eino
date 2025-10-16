@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"runtime/debug"
 
 	"github.com/bytedance/sonic"
 )
@@ -529,17 +530,50 @@ func internalSpecificTypeUnmarshal(is *internalStruct, typ reflect.Type) (any, e
 }
 
 func setSliceElems(dResult reflect.Value, values []*internalStruct) error {
-	t := dResult.Type()
-	for _, internalValue := range values {
-		value, err := internalUnmarshal(internalValue, t.Elem())
-		if err != nil {
-			return fmt.Errorf("unmarshal slice[%s] fail: %v", t.Elem(), err)
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("\n[EINO PANIC] setSliceElems panicked!\n")
+			fmt.Printf("[EINO PANIC] Slice/Array Type: %v, Element Type: %v\n", dResult.Type(), dResult.Type().Elem())
+			fmt.Printf("[EINO PANIC] Kind: %v, Len: %v, Cap: %v\n", dResult.Kind(), dResult.Len(), dResult.Cap())
+			fmt.Printf("[EINO PANIC] Panic: %v\n", r)
+			fmt.Printf("[EINO PANIC] Stack trace:\n%s\n", string(debug.Stack()))
+			panic(r) // Re-panic to propagate
 		}
-		if value == nil {
-			// empty value
-			dResult.Set(reflect.Append(dResult, reflect.New(t.Elem()).Elem()))
-		} else {
-			dResult.Set(reflect.Append(dResult, reflect.ValueOf(value)))
+	}()
+
+	t := dResult.Type()
+
+	// FIX: Handle arrays differently from slices
+	// Arrays have fixed size and cannot use reflect.Append
+	if dResult.Kind() == reflect.Array {
+		// For arrays, set each element by index
+		for i, internalValue := range values {
+			if i >= dResult.Len() {
+				return fmt.Errorf("array index out of bounds: trying to set index %d in array of length %d", i, dResult.Len())
+			}
+			value, err := internalUnmarshal(internalValue, t.Elem())
+			if err != nil {
+				return fmt.Errorf("unmarshal array[%s] element %d fail: %v", t.Elem(), i, err)
+			}
+			if value == nil {
+				dResult.Index(i).Set(reflect.Zero(t.Elem()))
+			} else {
+				dResult.Index(i).Set(reflect.ValueOf(value))
+			}
+		}
+	} else {
+		// For slices, use Append as before
+		for _, internalValue := range values {
+			value, err := internalUnmarshal(internalValue, t.Elem())
+			if err != nil {
+				return fmt.Errorf("unmarshal slice[%s] fail: %v", t.Elem(), err)
+			}
+			if value == nil {
+				// empty value
+				dResult.Set(reflect.Append(dResult, reflect.New(t.Elem()).Elem()))
+			} else {
+				dResult.Set(reflect.Append(dResult, reflect.ValueOf(value)))
+			}
 		}
 	}
 	return nil
@@ -622,6 +656,16 @@ func derefPointerNum(t reflect.Type) (uint32, reflect.Type) {
 }
 
 func createValueFromType(t reflect.Type) (value reflect.Value, derefValue reflect.Value) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("\n[EINO PANIC] createValueFromType panicked!\n")
+			fmt.Printf("[EINO PANIC] Type: %v, Kind: %v\n", t, t.Kind())
+			fmt.Printf("[EINO PANIC] Panic: %v\n", r)
+			fmt.Printf("[EINO PANIC] Stack trace:\n%s\n", string(debug.Stack()))
+			panic(r) // Re-panic to propagate
+		}
+	}()
+
 	value = reflect.New(t).Elem()
 
 	derefValue = value
@@ -636,8 +680,14 @@ func createValueFromType(t reflect.Type) (value reflect.Value, derefValue reflec
 		derefValue.Set(reflect.MakeMap(derefValue.Type()))
 	}
 
-	if (derefValue.Kind() == reflect.Slice || derefValue.Kind() == reflect.Array) && derefValue.IsNil() {
-		derefValue.Set(reflect.MakeSlice(derefValue.Type(), 0, 0))
+	// FIX: Use Len() == 0 instead of IsNil() for slices to avoid panic
+	// IsNil() can panic on uninitialized slice values created via reflect.New().Elem()
+	if derefValue.Kind() == reflect.Slice {
+		if derefValue.Len() == 0 && derefValue.Cap() == 0 {
+			derefValue.Set(reflect.MakeSlice(derefValue.Type(), 0, 0))
+		}
+	} else if derefValue.Kind() == reflect.Array {
+		// Arrays can't be nil, so no initialization needed
 	}
 
 	return value, derefValue
